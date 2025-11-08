@@ -1,0 +1,157 @@
+#!/bin/bash
+set -euo pipefail
+
+log() {
+    echo "✅ $1" >&2
+}
+
+# Map VPC name to CIDR base (to avoid overlap)
+get_vpc_cidr() {
+    local name="$1"
+    case "$name" in
+        prod) echo "10.10" ;;
+        dev)  echo "10.20" ;;
+        test) echo "10.30" ;;
+        *)    echo "10.$((RANDOM % 250 + 1))" ;; # fallback
+    esac
+}
+
+create_vpc() {
+    local vpc_name="$1"
+    local internet_iface="$2"
+
+    local BRIDGE="br-${vpc_name}"
+    local PUBLIC_NS="${vpc_name}-pub"
+    local PRIVATE_NS="${vpc_name}-priv"
+
+    # Unique CIDR per VPC
+    local BASE_CIDR
+    BASE_CIDR=$(get_vpc_cidr "$vpc_name")
+    local PUBLIC_NET="${BASE_CIDR}.1.0/24"
+    local PUBLIC_HOST_IP="${BASE_CIDR}.1.2/24"
+    local PUBLIC_GW="${BASE_CIDR}.1.1"
+
+    local PRIVATE_NET="${BASE_CIDR}.2.0/24"
+    local PRIVATE_HOST_IP="${BASE_CIDR}.2.2/24"
+    local PRIVATE_GW="${BASE_CIDR}.2.1"
+
+    log "Creating VPC: $vpc_name (CIDR: ${BASE_CIDR}.0.0/16)"
+    ip link add "$BRIDGE" type bridge
+    ip link set "$BRIDGE" up
+
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    sysctl -w net.ipv4.conf."$BRIDGE".rp_filter=0 >/dev/null
+
+    # Public subnet
+    ip netns add "$PUBLIC_NS"
+    ip link add "${PUBLIC_NS}-veth0" type veth peer name "${PUBLIC_NS}-br"
+    ip link set "${PUBLIC_NS}-br" master "$BRIDGE"
+    ip link set "${PUBLIC_NS}-br" up
+    ip link set "${PUBLIC_NS}-veth0" netns "$PUBLIC_NS"
+
+    ip netns exec "$PUBLIC_NS" ip addr add "$PUBLIC_HOST_IP" dev "${PUBLIC_NS}-veth0"
+    ip netns exec "$PUBLIC_NS" ip link set "${PUBLIC_NS}-veth0" up
+    ip netns exec "$PUBLIC_NS" ip link set lo up
+    ip netns exec "$PUBLIC_NS" ip route add default via "$PUBLIC_GW"
+
+    ip addr add "${PUBLIC_GW}/24" dev "$BRIDGE"
+
+    # Private subnet
+    ip netns add "$PRIVATE_NS"
+    ip link add "${PRIVATE_NS}-veth0" type veth peer name "${PRIVATE_NS}-br"
+    ip link set "${PRIVATE_NS}-br" master "$BRIDGE"
+    ip link set "${PRIVATE_NS}-br" up
+    ip link set "${PRIVATE_NS}-veth0" netns "$PRIVATE_NS"
+
+    ip netns exec "$PRIVATE_NS" ip addr add "$PRIVATE_HOST_IP" dev "${PRIVATE_NS}-veth0"
+    ip netns exec "$PRIVATE_NS" ip link set "${PRIVATE_NS}-veth0" up
+    ip netns exec "$PRIVATE_NS" ip link set lo up
+    ip netns exec "$PRIVATE_NS" ip route add default via "$PRIVATE_GW"
+
+    ip addr add "${PRIVATE_GW}/24" dev "$BRIDGE"
+
+    # NAT for public subnet
+    iptables -t nat -A POSTROUTING -s "$PUBLIC_NET" -o "$internet_iface" -j MASQUERADE
+    iptables -A FORWARD -i "$BRIDGE" -o "$internet_iface" -j ACCEPT
+    iptables -A FORWARD -i "$internet_iface" -o "$BRIDGE" -m state --state RELATED,ESTABLISHED -j ACCEPT
+    iptables -A FORWARD -i "$BRIDGE" -j ACCEPT
+    iptables -A FORWARD -o "$BRIDGE" -j ACCEPT
+
+    # DNS
+    mkdir -p "/etc/netns/$PUBLIC_NS" "/etc/netns/$PRIVATE_NS"
+    echo "nameserver 8.8.8.8" > "/etc/netns/$PUBLIC_NS/resolv.conf"
+    echo "nameserver 8.8.8.8" > "/etc/netns/$PRIVATE_NS/resolv.conf"
+
+    log "VPC '$vpc_name' created!"
+    log "  Public:  $PUBLIC_HOST_IP (ns: $PUBLIC_NS)"
+    log "  Private: $PRIVATE_HOST_IP (ns: $PRIVATE_NS)"
+}
+
+delete_vpc() {
+    local vpc_name="$1"
+    local BRIDGE="br-${vpc_name}"
+    local PUBLIC_NS="${vpc_name}-pub"
+    local PRIVATE_NS="${vpc_name}-priv"
+
+    # Reconstruct CIDR to remove rules
+    local BASE_CIDR
+    BASE_CIDR=$(get_vpc_cidr "$vpc_name")
+    local PUBLIC_NET="${BASE_CIDR}.1.0/24"
+    local internet_iface=$(ip route show default | awk '{print $5; exit}')
+
+    log "Deleting VPC: $vpc_name"
+    iptables -t nat -D POSTROUTING -s "$PUBLIC_NET" -o "$internet_iface" -j MASQUERADE 2>/dev/null || true
+    iptables -D FORWARD -i "$BRIDGE" -o "$internet_iface" -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -i "$internet_iface" -o "$BRIDGE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -i "$BRIDGE" -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -o "$BRIDGE" -j ACCEPT 2>/dev/null || true
+
+    ip netns del "$PUBLIC_NS" 2>/dev/null || true
+    ip netns del "$PRIVATE_NS" 2>/dev/null || true
+    ip link delete "$BRIDGE" 2>/dev/null || true
+    rm -rf "/etc/netns/$PUBLIC_NS" "/etc/netns/$PRIVATE_NS"
+
+    log "VPC '$vpc_name' deleted."
+}
+
+show_help() {
+    cat <<EOF
+Usage: $0 <command> [options]
+
+Commands:
+  create    --name <vpc> --internet-interface <iface>
+  delete    --name <vpc>
+EOF
+}
+
+if [[ $# -eq 0 ]]; then
+    show_help
+    exit 1
+fi
+
+COMMAND="$1"; shift
+
+case "$COMMAND" in
+    create)
+        if [[ $# -lt 4 ]] || [[ "$1" != "--name" ]] || [[ "$3" != "--internet-interface" ]]; then
+            echo "Error: Usage: $0 create --name <vpc> --internet-interface <iface>" >&2
+            exit 1
+        fi
+        VPC_NAME="$2"
+        INTERNET_IFACE="$4"
+        create_vpc "$VPC_NAME" "$INTERNET_IFACE"
+        ;;
+    delete)
+        if [[ $# -lt 2 ]] || [[ "$1" != "--name" ]]; then
+            echo "Error: Usage: $0 delete --name <vpc>" >&2
+            exit 1
+        fi
+        VPC_NAME="$2"
+        delete_vpc "$VPC_NAME"
+        ;;
+    *)
+        echo "Unknown command: $COMMAND" >&2
+        show_help
+        exit 1
+        ;;
+esac

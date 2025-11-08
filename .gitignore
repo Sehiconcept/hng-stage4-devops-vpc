@@ -1,0 +1,2 @@
+# Ignore netns DNS configs (generated at runtime)
+/etc/netns/
