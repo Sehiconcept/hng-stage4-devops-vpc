@@ -11,7 +11,7 @@ log() {
 apply_firewall_rules() {
     local ns="$1"
     local vpc_name="$2"
-    local subnet_type="$3"  # "public" or "private"
+    local subnet_type="$3"
 
     if [[ ! -f "$FIREWALL_FILE" ]]; then
         log "No firewall policy file found. Skipping firewall rules."
@@ -22,13 +22,18 @@ apply_firewall_rules() {
     ip netns exec "$ns" iptables -P INPUT ACCEPT
     ip netns exec "$ns" iptables -F INPUT
 
-    # Extract rules for this (vpc, subnet_type)
+    # Parse and apply rules with proper target mapping
     local rules
     rules=$(jq -r --arg vpc "$vpc_name" --arg type "$subnet_type" '
         .policies[] |
         select(.vpc == $vpc and .subnet_type == $type) |
         .ingress[] |
-        "-A INPUT -p \(.protocol) --dport \(.port) -j \(.action | ascii_upcase)"
+        {
+            port: .port,
+            protocol: .protocol,
+            target: (.action | if . == "allow" then "ACCEPT" else "DROP" end)
+        } |
+        "-A INPUT -p \(.protocol) --dport \(.port) -j \(.target)"
     ' "$FIREWALL_FILE" 2>/dev/null || true)
 
     if [[ -n "$rules" ]]; then
@@ -42,7 +47,7 @@ apply_firewall_rules() {
         log "  No firewall rules for VPC='$vpc_name', subnet='$subnet_type'"
     fi
 
-    # Default DROP after rules
+    # Allow established/related and loopback
     ip netns exec "$ns" iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
     ip netns exec "$ns" iptables -A INPUT -i lo -j ACCEPT
     ip netns exec "$ns" iptables -P INPUT DROP
