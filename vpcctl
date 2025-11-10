@@ -1,21 +1,65 @@
 #!/bin/bash
 set -euo pipefail
 
+FIREWALL_FILE="${FIREWALL_FILE:-firewall.json}"
+
 log() {
     echo "✅ $1" >&2
 }
 
-# Map VPC name to CIDR base (to avoid overlap)
+# === FIREWALL: Apply rules from JSON ===
+apply_firewall_rules() {
+    local ns="$1"
+    local vpc_name="$2"
+    local subnet_type="$3"  # "public" or "private"
+
+    if [[ ! -f "$FIREWALL_FILE" ]]; then
+        log "No firewall policy file found. Skipping firewall rules."
+        return 0
+    fi
+
+    # Reset INPUT chain in namespace
+    ip netns exec "$ns" iptables -P INPUT ACCEPT
+    ip netns exec "$ns" iptables -F INPUT
+
+    # Extract rules for this (vpc, subnet_type)
+    local rules
+    rules=$(jq -r --arg vpc "$vpc_name" --arg type "$subnet_type" '
+        .policies[] |
+        select(.vpc == $vpc and .subnet_type == $type) |
+        .ingress[] |
+        "-A INPUT -p \(.protocol) --dport \(.port) -j \(.action | ascii_upcase)"
+    ' "$FIREWALL_FILE" 2>/dev/null || true)
+
+    if [[ -n "$rules" ]]; then
+        while IFS= read -r rule; do
+            if [[ -n "$rule" ]]; then
+                ip netns exec "$ns" iptables $rule
+                log "  Applied firewall rule: $rule"
+            fi
+        done <<< "$rules"
+    else
+        log "  No firewall rules for VPC='$vpc_name', subnet='$subnet_type'"
+    fi
+
+    # Default DROP after rules
+    ip netns exec "$ns" iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+    ip netns exec "$ns" iptables -A INPUT -i lo -j ACCEPT
+    ip netns exec "$ns" iptables -P INPUT DROP
+}
+
+# === CIDR MAP (to avoid overlap) ===
 get_vpc_cidr() {
     local name="$1"
     case "$name" in
         prod) echo "10.10" ;;
         dev)  echo "10.20" ;;
         test) echo "10.30" ;;
-        *)    echo "10.$((RANDOM % 250 + 1))" ;; # fallback
+        *)    echo "10.$((RANDOM % 250 + 1))" ;;
     esac
 }
 
+# === CREATE VPC ===
 create_vpc() {
     local vpc_name="$1"
     local internet_iface="$2"
@@ -24,7 +68,6 @@ create_vpc() {
     local PUBLIC_NS="${vpc_name}-pub"
     local PRIVATE_NS="${vpc_name}-priv"
 
-    # Unique CIDR per VPC
     local BASE_CIDR
     BASE_CIDR=$(get_vpc_cidr "$vpc_name")
     local PUBLIC_NET="${BASE_CIDR}.1.0/24"
@@ -35,6 +78,9 @@ create_vpc() {
     local PRIVATE_HOST_IP="${BASE_CIDR}.2.2/24"
     local PRIVATE_GW="${BASE_CIDR}.2.1"
 
+    # Cleanup any leftovers first (idempotent)
+    delete_vpc "$vpc_name" 2>/dev/null || true
+
     log "Creating VPC: $vpc_name (CIDR: ${BASE_CIDR}.0.0/16)"
     ip link add "$BRIDGE" type bridge
     ip link set "$BRIDGE" up
@@ -42,7 +88,7 @@ create_vpc() {
     sysctl -w net.ipv4.ip_forward=1 >/dev/null
     sysctl -w net.ipv4.conf."$BRIDGE".rp_filter=0 >/dev/null
 
-    # Public subnet
+    # === Public Subnet ===
     ip netns add "$PUBLIC_NS"
     ip link add "${PUBLIC_NS}-veth0" type veth peer name "${PUBLIC_NS}-br"
     ip link set "${PUBLIC_NS}-br" master "$BRIDGE"
@@ -53,10 +99,9 @@ create_vpc() {
     ip netns exec "$PUBLIC_NS" ip link set "${PUBLIC_NS}-veth0" up
     ip netns exec "$PUBLIC_NS" ip link set lo up
     ip netns exec "$PUBLIC_NS" ip route add default via "$PUBLIC_GW"
-
     ip addr add "${PUBLIC_GW}/24" dev "$BRIDGE"
 
-    # Private subnet
+    # === Private Subnet ===
     ip netns add "$PRIVATE_NS"
     ip link add "${PRIVATE_NS}-veth0" type veth peer name "${PRIVATE_NS}-br"
     ip link set "${PRIVATE_NS}-br" master "$BRIDGE"
@@ -67,53 +112,66 @@ create_vpc() {
     ip netns exec "$PRIVATE_NS" ip link set "${PRIVATE_NS}-veth0" up
     ip netns exec "$PRIVATE_NS" ip link set lo up
     ip netns exec "$PRIVATE_NS" ip route add default via "$PRIVATE_GW"
-
     ip addr add "${PRIVATE_GW}/24" dev "$BRIDGE"
 
-    # NAT for public subnet
+    # === NAT & FORWARDING ===
     iptables -t nat -A POSTROUTING -s "$PUBLIC_NET" -o "$internet_iface" -j MASQUERADE
     iptables -A FORWARD -i "$BRIDGE" -o "$internet_iface" -j ACCEPT
     iptables -A FORWARD -i "$internet_iface" -o "$BRIDGE" -m state --state RELATED,ESTABLISHED -j ACCEPT
     iptables -A FORWARD -i "$BRIDGE" -j ACCEPT
     iptables -A FORWARD -o "$BRIDGE" -j ACCEPT
 
-    # DNS
+    # === DNS ===
     mkdir -p "/etc/netns/$PUBLIC_NS" "/etc/netns/$PRIVATE_NS"
     echo "nameserver 8.8.8.8" > "/etc/netns/$PUBLIC_NS/resolv.conf"
     echo "nameserver 8.8.8.8" > "/etc/netns/$PRIVATE_NS/resolv.conf"
 
-    log "VPC '$vpc_name' created!"
-    log "  Public:  $PUBLIC_HOST_IP (ns: $PUBLIC_NS)"
-    log "  Private: $PRIVATE_HOST_IP (ns: $PRIVATE_NS)"
+    # === FIREWALL ===
+    apply_firewall_rules "$PUBLIC_NS" "$vpc_name" "public"
+    apply_firewall_rules "$PRIVATE_NS" "$vpc_name" "private"
+
+    log "VPC '$vpc_name' created with firewall rules!"
 }
 
+# === DELETE VPC (Robust Cleanup) ===
 delete_vpc() {
     local vpc_name="$1"
     local BRIDGE="br-${vpc_name}"
     local PUBLIC_NS="${vpc_name}-pub"
     local PRIVATE_NS="${vpc_name}-priv"
 
-    # Reconstruct CIDR to remove rules
+    log "Deleting VPC: $vpc_name"
+
+    # Kill any processes in namespaces
+    ip netns pids "$PUBLIC_NS" 2>/dev/null | xargs -r kill -9
+    ip netns pids "$PRIVATE_NS" 2>/dev/null | xargs -r kill -9
+
+    # Remove namespaces
+    ip netns del "$PUBLIC_NS" 2>/dev/null || true
+    ip netns del "$PRIVATE_NS" 2>/dev/null || true
+
+    # Remove bridge
+    ip link delete "$BRIDGE" 2>/dev/null || true
+
+    # Remove DNS configs
+    rm -rf "/etc/netns/$PUBLIC_NS" "/etc/netns/$PRIVATE_NS"
+
+    # Remove iptables rules (best effort)
     local BASE_CIDR
     BASE_CIDR=$(get_vpc_cidr "$vpc_name")
     local PUBLIC_NET="${BASE_CIDR}.1.0/24"
     local internet_iface=$(ip route show default | awk '{print $5; exit}')
 
-    log "Deleting VPC: $vpc_name"
     iptables -t nat -D POSTROUTING -s "$PUBLIC_NET" -o "$internet_iface" -j MASQUERADE 2>/dev/null || true
     iptables -D FORWARD -i "$BRIDGE" -o "$internet_iface" -j ACCEPT 2>/dev/null || true
     iptables -D FORWARD -i "$internet_iface" -o "$BRIDGE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
     iptables -D FORWARD -i "$BRIDGE" -j ACCEPT 2>/dev/null || true
     iptables -D FORWARD -o "$BRIDGE" -j ACCEPT 2>/dev/null || true
 
-    ip netns del "$PUBLIC_NS" 2>/dev/null || true
-    ip netns del "$PRIVATE_NS" 2>/dev/null || true
-    ip link delete "$BRIDGE" 2>/dev/null || true
-    rm -rf "/etc/netns/$PUBLIC_NS" "/etc/netns/$PRIVATE_NS"
-
-    log "VPC '$vpc_name' deleted."
+    log "VPC '$vpc_name' fully deleted."
 }
 
+# === CLI ===
 show_help() {
     cat <<EOF
 Usage: $0 <command> [options]
