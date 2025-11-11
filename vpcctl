@@ -3,9 +3,18 @@ set -euo pipefail
 
 FIREWALL_FILE="${FIREWALL_FILE:-firewall.json}"
 
+# Enhanced log function: writes to both stdout and log file
 log() {
-    echo "✅ $1" >&2
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo "✅ $msg" >&2
+    echo "$msg" >> /var/log/vpcctl.log
 }
+
+# Ensure log file exists
+if [[ ! -f /var/log/vpcctl.log ]]; then
+    sudo touch /var/log/vpcctl.log
+    sudo chmod 644 /var/log/vpcctl.log
+fi
 
 # === FIREWALL: Apply rules from JSON ===
 apply_firewall_rules() {
